@@ -93,6 +93,10 @@ export interface Repo {
   nextNumber: number;
   /** Byte length of file content is derived; commit insertion order for history. */
   commitSeq: Map<string, number>;
+  /** Commit oid -> parent oids, parsed once at store time (never re-parsed). */
+  commitParents: Map<string, string[]>;
+  /** Commit oid -> generation (longest path to a root), computed lazily, memoized. */
+  commitGen: Map<string, number>;
 }
 
 export class Store {
@@ -180,6 +184,8 @@ export class Store {
       comments: new Map(),
       nextNumber: 1,
       commitSeq: new Map(),
+      commitParents: new Map(),
+      commitGen: new Map(),
     };
     this.repos.set(this.repoKey(owner, name), repo);
     return repo;
@@ -193,9 +199,17 @@ export class Store {
 
   storeObject(repo: Repo, type: GitObjectType, data: Buffer): string {
     const oid = hashObject(type, data);
+    return this.storeObjectWithOid(repo, type, data, oid);
+  }
+
+  /** Store an object whose oid is already known (e.g. from readPack): skips the re-hash. */
+  storeObjectWithOid(repo: Repo, type: GitObjectType, data: Buffer, oid: string): string {
     if (!repo.objects.has(oid)) {
       repo.objects.set(oid, { type, data });
-      if (type === 'commit') repo.commitSeq.set(oid, this.newSeq());
+      if (type === 'commit') {
+        repo.commitSeq.set(oid, this.newSeq());
+        repo.commitParents.set(oid, parseCommit(data).parents);
+      }
     }
     return oid;
   }
@@ -450,7 +464,7 @@ export class Store {
       number: repo.nextNumber++,
       title,
       body,
-      state: 'open',
+      state: issue.state,
       labels: [...labelNames],
       userLogin: VIEWER.login,
       createdSeq: this.newSeq(),
@@ -486,7 +500,7 @@ export class Store {
       number: repo.nextNumber++,
       title,
       body,
-      state: 'open',
+      state: issue.state,
       merged: false,
       mergedAt: null,
       mergeCommitSha: null,
@@ -571,7 +585,7 @@ export function issueJson(repo: Repo, issue: Issue, store: Store): Record<string
 export function repoJson(repo: Repo, store: Store): Record<string, unknown> {
   return {
     id: repo.id,
-    name: repo.name,
+    name: repo.full_name,
     full_name: `${repo.owner}/${repo.name}`,
     owner: {
       login: repo.owner,
