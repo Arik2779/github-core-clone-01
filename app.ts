@@ -16,6 +16,11 @@ function splitSegments(pathname: string): string[] {
   const segments: string[] = [];
   for (const raw of pathname.split('/')) {
     if (raw === '') continue;
+    // decodeURIComponent is identity when there is no '%' to decode; skip it.
+    if (!raw.includes('%')) {
+      segments.push(raw);
+      continue;
+    }
     try {
       segments.push(decodeURIComponent(raw));
     } catch {
