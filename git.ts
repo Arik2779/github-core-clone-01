@@ -101,6 +101,9 @@ function v2Advertisement(): Buffer {
   return Buffer.concat(chunks);
 }
 
+/** The v2 advertisement never depends on repo state: build it once. */
+const V2_ADVERTISEMENT = v2Advertisement();
+
 export function handleInfoRefs(ctx: Ctx, owner: string, name: string): void {
   const repo = ctx.store.getRepo(owner, name);
   if (!repo) {
@@ -110,7 +113,7 @@ export function handleInfoRefs(ctx: Ctx, owner: string, name: string): void {
   const service = ctx.url.searchParams.get('service') ?? '';
   const wantsV2 = (ctx.req.headers['git-protocol'] ?? '') === 'version=2';
   if (service === 'git-upload-pack') {
-    const body = wantsV2 ? v2Advertisement() : v0Advertisement(repo, 'upload');
+    const body = wantsV2 ? V2_ADVERTISEMENT : v0Advertisement(repo, 'upload');
     sendBuffer(ctx, 200, body, 'application/x-git-upload-pack-advertisement');
     return;
   }
@@ -257,19 +260,76 @@ function truncateHeld(repo: Repo, haves: readonly string[], stopAt: ReadonlySet<
   return walkFrom(repo, haves, undefined, stopAt).objects;
 }
 
+/** Parent oids of a stored commit, from the store-time cache (fallback: parse once). */
+function commitParentsOf(repo: Repo, oid: string): string[] | undefined {
+  const cached = repo.commitParents.get(oid);
+  if (cached !== undefined) return cached;
+  const object = repo.objects.get(oid);
+  if (!object || object.type !== 'commit') return undefined;
+  const parents = parseCommit(object.data).parents;
+  repo.commitParents.set(oid, parents);
+  return parents;
+}
+
+/**
+ * Generation of a stored commit (0 for a root, else 1 + max parent generation),
+ * memoized. Computed iteratively (reverse DFS visit order puts parents before
+ * children), so deep histories never recurse. Objects are immutable, so a
+ * cached generation never goes stale.
+ */
+function commitGenOf(repo: Repo, oid: string): number | undefined {
+  const cached = repo.commitGen.get(oid);
+  if (cached !== undefined) return cached;
+  if (commitParentsOf(repo, oid) === undefined) return undefined;
+  const order: string[] = [];
+  const seen = new Set<string>();
+  const stack = [oid];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (seen.has(cur) || repo.commitGen.has(cur)) continue;
+    seen.add(cur);
+    order.push(cur);
+    for (const parent of commitParentsOf(repo, cur) ?? []) {
+      if (!repo.commitGen.has(parent)) stack.push(parent);
+    }
+  }
+  for (let i = order.length - 1; i >= 0; i--) {
+    const cur = order[i]!;
+    if (commitParentsOf(repo, cur) === undefined) continue;
+    let gen = 0;
+    for (const parent of commitParentsOf(repo, cur) ?? []) {
+      const pg = repo.commitGen.get(parent);
+      if (pg !== undefined && pg + 1 > gen) gen = pg + 1;
+    }
+    repo.commitGen.set(cur, gen);
+  }
+  return repo.commitGen.get(oid);
+}
+
 /** Whether `ancestor` is reachable from `tip` (an ancestor check for fast-forwards). */
 export function isAncestor(repo: Repo, ancestor: string, tip: string): boolean {
   if (ancestor === tip) return true;
+  // Generation pruning: an ancestor must be no newer than the tip, and the
+  // walk only follows parents that could still lead to it.
+  const ancestorGen = commitGenOf(repo, ancestor);
+  if (ancestorGen !== undefined) {
+    const tipGen = commitGenOf(repo, tip);
+    if (tipGen !== undefined && tipGen < ancestorGen) return false;
+  }
   const seen = new Set<string>();
   const stack = [tip];
   while (stack.length > 0) {
     const oid = stack.pop()!;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const object = repo.objects.get(oid);
-    if (!object || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) {
+    const parents = commitParentsOf(repo, oid);
+    if (parents === undefined) continue;
+    for (const parent of parents) {
       if (parent === ancestor) return true;
+      if (ancestorGen !== undefined) {
+        const pg = commitGenOf(repo, parent);
+        if (pg !== undefined && pg < ancestorGen) continue;
+      }
       stack.push(parent);
     }
   }
@@ -353,12 +413,16 @@ function handleFetchV2(ctx: Ctx, repo: Repo, request: FetchRequest): void {
   }
   // packfile: always present, even when nothing is sent (an empty pack).
   const objects: GitObject[] = [];
+  const oids: string[] = [];
   for (const oid of [...send].sort()) {
     const object = repo.objects.get(oid);
-    if (object) objects.push(object);
+    if (object) {
+      objects.push(object);
+      oids.push(oid);
+    }
   }
   parts.push(encodePktLine('packfile\n'));
-  parts.push(...encodeSideband(1, writePack(objects)));
+  parts.push(...encodeSideband(1, writePack(objects, oids)));
   parts.push(FLUSH_PKT);
   sendBuffer(ctx, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
 }
@@ -392,11 +456,15 @@ function handleFetchV0(ctx: Ctx, repo: Repo, request: FetchRequest): void {
     else parts.push(encodePktLine(`shallow ${boundary}\n`));
   }
   const objects: GitObject[] = [];
+  const oids: string[] = [];
   for (const oid of [...send].sort()) {
     const object = repo.objects.get(oid);
-    if (object) objects.push(object);
+    if (object) {
+      objects.push(object);
+      oids.push(oid);
+    }
   }
-  parts.push(...encodeSideband(1, writePack(objects)));
+  parts.push(...encodeSideband(1, writePack(objects, oids)));
   parts.push(FLUSH_PKT);
   sendBuffer(ctx, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
 }
@@ -508,9 +576,10 @@ export function handleReceivePack(ctx: Ctx, owner: string, name: string): void {
       try {
         const objects = readPack(parsed.pack, (oid) => repo.objects.get(oid));
         // Store through the store so commit insertion order (used by history)
-        // stays consistent across the git and REST surfaces.
-        for (const object of objects.values()) {
-          ctx.store.storeObject(repo, object.type, object.data);
+        // stays consistent across the git and REST surfaces. The oids are
+        // already known from the pack, so no re-hash is needed.
+        for (const [oid, object] of objects) {
+          ctx.store.storeObjectWithOid(repo, object.type, object.data, oid);
         }
       } catch (error) {
         unpackDetail = error instanceof Error ? error.message : 'invalid packfile';
