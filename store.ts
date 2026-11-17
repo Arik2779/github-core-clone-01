@@ -464,7 +464,7 @@ export class Store {
       number: repo.nextNumber++,
       title,
       body,
-      state: issue.state,
+      state: 'open',
       labels: [...labelNames],
       userLogin: VIEWER.login,
       createdSeq: this.newSeq(),
@@ -500,7 +500,7 @@ export class Store {
       number: repo.nextNumber++,
       title,
       body,
-      state: issue.state,
+      state: 'open',
       merged: false,
       mergedAt: null,
       mergeCommitSha: null,
@@ -585,7 +585,7 @@ export function issueJson(repo: Repo, issue: Issue, store: Store): Record<string
 export function repoJson(repo: Repo, store: Store): Record<string, unknown> {
   return {
     id: repo.id,
-    name: repo.full_name,
+    name: repo.name,
     full_name: `${repo.owner}/${repo.name}`,
     owner: {
       login: repo.owner,
