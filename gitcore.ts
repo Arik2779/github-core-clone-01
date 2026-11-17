@@ -332,17 +332,55 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
  * Serialise plain (undeltified) objects into a version 2 packfile. The entries are
  * written in the order given; a caller's sort is irrelevant for correctness.
  */
-export function writePack(objects: readonly GitObject[]): Buffer {
-  const parts: Buffer[] = [Buffer.concat([Buffer.from('PACK', 'ascii'), Buffer.from([0, 0, 0, 2])])];
-  const count = Buffer.alloc(4);
-  count.writeUInt32BE(objects.length, 0);
-  parts.push(count);
-  for (const object of objects) {
-    const header = encodePackObjectHeader(TYPE_CODE[object.type], object.data.length);
-    parts.push(header, zlibDeflateSync(object.data));
+/**
+ * Cache of deflated object payloads, keyed by oid (the oid fixes type + data,
+ * and stored objects are never mutated in place, so a cached entry stays
+ * correct for the life of the process). Packs are rebuilt constantly — the
+ * same objects are packed on every fetch of a repo — while the deflate is
+ * the most expensive step of writePack, so this is the single biggest
+ * server-CPU saving in the git transport path. FIFO eviction, bounded.
+ */
+interface CachedDeflated {
+  header: Buffer;
+  deflated: Buffer;
+}
+const deflateCache = new Map<string, CachedDeflated>();
+const DEFLATE_CACHE_MAX = 1024;
+
+function deflatedObject(oid: string, type: GitObjectType, data: Buffer): CachedDeflated {
+  const hit = deflateCache.get(oid);
+  if (hit) return hit;
+  const entry: CachedDeflated = {
+    header: encodePackObjectHeader(TYPE_CODE[type], data.length),
+    deflated: zlibDeflateSync(data),
+  };
+  if (deflateCache.size >= DEFLATE_CACHE_MAX) {
+    const oldest = deflateCache.keys().next().value;
+    if (oldest !== undefined) deflateCache.delete(oldest);
   }
-  const checksum = sha1Hex(Buffer.concat(parts));
-  parts.push(Buffer.from(checksum, 'hex'));
+  deflateCache.set(oid, entry);
+  return entry;
+}
+
+export function writePack(objects: readonly GitObject[], oids?: readonly string[]): Buffer {
+  const hash = createHash('sha1');
+  const parts: Buffer[] = [];
+  const header = Buffer.alloc(12);
+  header.write('PACK', 0, 'ascii');
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(objects.length, 8);
+  hash.update(header);
+  parts.push(header);
+  for (let i = 0; i < objects.length; i++) {
+    const object = objects[i]!;
+    const oid = oids?.[i] ?? hashObject(object.type, object.data);
+    const { header: objHeader, deflated } = deflatedObject(oid, object.type, object.data);
+    hash.update(objHeader);
+    hash.update(deflated);
+    parts.push(objHeader, deflated);
+  }
+  const checksum = Buffer.from(hash.digest('hex'), 'hex');
+  parts.push(checksum);
   return Buffer.concat(parts);
 }
 
